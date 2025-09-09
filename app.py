@@ -1,22 +1,22 @@
 """
 L-Number Lookup — Brave Search Engine Mode
 ------------------------------------------
-Version: 2.2.0 (backend-only secret)
+Version: 2.2.1 (backend-only secret, inline thumbnails)
 
 - NEVER calls londondrugs.com directly (no scraping, no mirrors).
 - Uses Brave Search API (web + image) to find a best-match title + thumbnail per L-number.
 - Exports Excel, CSV, and a PDF with embedded thumbnails.
+- Shows thumbnails inline in the HTML table via data URIs (no hotlinking).
 - API key is read ONLY from backend (Streamlit secrets or environment variables).
   * env var: BRAVE_SEARCH_KEY
   * optional env var: BRAVE_SEARCH_ENDPOINT (default: https://api.search.brave.com)
-
-No API key is shown in the UI.
 """
 
 import io
 import os
 import re
 import html
+import base64
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -37,7 +37,7 @@ except Exception:
 import httpx
 
 # -------------------- App config --------------------
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 
 st.set_page_config(page_title="L-Number Lookup (Brave Search Mode)", layout="wide")
 st.markdown(
@@ -58,7 +58,6 @@ st.caption("No contact with the source website. Uses Brave Search results (title
 
 # -------------------- Secret loading (backend only) --------------------
 def _get_secret(name: str, default: str = "") -> str:
-    # Try Streamlit secrets first, then environment
     if hasattr(st, "secrets"):
         try:
             v = st.secrets.get(name, "")
@@ -189,7 +188,8 @@ async def resolve_one(client: httpx.AsyncClient, token: str, lnum: str, prefer: 
     queries.append(lnum)
 
     best_title = "NOT FOUND"
-    best_image = "NOT FOUND"
+    best_image = "NOT FOUND"     # from image search
+    best_web_thumb = None        # from web results (fallback)
     best_url   = "—"
 
     for q in queries:
@@ -201,22 +201,36 @@ async def resolve_one(client: httpx.AsyncClient, token: str, lnum: str, prefer: 
             chosen = ranked[0]
             best_title = chosen.get("title") or chosen.get("description") or best_title
             best_url = chosen.get("url") or best_url
+            # capture web thumbnail as a fallback
+            if not best_web_thumb:
+                best_web_thumb = chosen.get("thumbnail")
 
         if img and best_image == "NOT FOUND":
-            img_sorted = sorted(img, key=lambda it: (1 if prefer and prefer.lower() in (it.get("hostPageUrl","").lower()) else 0), reverse=True)
+            img_sorted = sorted(
+                img,
+                key=lambda it: (1 if prefer and prefer.lower() in (it.get("hostPageUrl","").lower()) else 0),
+                reverse=True
+            )
             best_image = img_sorted[0].get("thumbnailUrl") or best_image
 
-        if best_title != "NOT FOUND" and best_image != "NOT FOUND":
+        if best_title != "NOT FOUND" and (best_image != "NOT FOUND" or best_web_thumb):
             break
 
-    return {"L-Number": lnum, "Product Name": best_title, "Product Image": best_image, "Source URL": best_url}
+    chosen_thumb = best_image if best_image != "NOT FOUND" else (best_web_thumb or "NOT FOUND")
+
+    return {
+        "L-Number": lnum,
+        "Product Name": best_title,
+        "Product Image": chosen_thumb,
+        "Source URL": best_url,
+    }
 
 async def download_image(client: httpx.AsyncClient, url: str, max_w: int) -> Optional[bytes]:
     if not url or url == "NOT FOUND":
         return None
     try:
         r = await client.get(url)
-        if r.status_code != 200:
+        if r.status_code != 200 or not r.content:
             return None
         img = PILImage.open(io.BytesIO(r.content)).convert("RGB")
         if img.width > max_w:
@@ -261,6 +275,10 @@ def build_pdf(rows: List[Dict[str, str]], img_width_px: int, images: Dict[str, O
     story.append(table)
     doc.build(story)
     return buf.getvalue()
+
+def as_data_uri(jpeg_bytes: bytes) -> str:
+    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
 
 # -------------------- Ingest input --------------------
 lnums: List[str] = []
@@ -356,9 +374,9 @@ if lnums:
         st.download_button("⬇️ Download results (CSV)", data=df.to_csv(index=False),
                            file_name="lnumber_brave_results.csv", mime="text/csv")
 
-        # PDF (download thumbnails first)
-        status.write("Building PDF (with thumbnails)…")
-        async def build_pdf_async():
+        # Download thumbnails (for PDF and inline HTML)
+        status.write("Fetching thumbnails…")
+        async def fetch_thumbs():
             urls = sorted(set(u for u in df["Product Image"].tolist() if u and u != "NOT FOUND"))
             blobs: Dict[str, Optional[bytes]] = {}
             sem = asyncio.Semaphore(8)
@@ -367,18 +385,29 @@ if lnums:
                     async with sem:
                         blobs[u] = await download_image(client, u, img_width)
                 await asyncio.gather(*[dl(u) for u in urls])
-            return build_pdf(results, img_width, blobs)
+            return blobs
 
-        pdf_bytes = asyncio.run(build_pdf_async())
+        blobs_map = asyncio.run(fetch_thumbs())
+
+        # PDF
+        status.write("Building PDF (with thumbnails)…")
+        pdf_bytes = build_pdf(results, img_width, blobs_map)
         st.download_button("⬇️ Download results (PDF with images)", data=pdf_bytes,
                            file_name="lnumber_brave_results.pdf", mime="application/pdf")
 
-        # HTML preview with images + source link
-        def table_html(rows: List[Dict[str, str]], w: int) -> str:
+        # HTML preview with INLINE images to avoid hotlinking failures
+        def table_html(rows: List[Dict[str, str]], w: int, blobs: Dict[str, Optional[bytes]]) -> str:
             trs = []
             for r in rows:
-                img_html = (f'<img src="{html.escape(r["Product Image"])}" width="{w}">'
-                            if r["Product Image"] != "NOT FOUND" else "<b>NOT FOUND</b>")
+                src = r["Product Image"]
+                if src != "NOT FOUND" and blobs.get(src):
+                    data_uri = as_data_uri(blobs[src])
+                    img_html = f'<img src="{data_uri}" width="{w}">'
+                elif src != "NOT FOUND":
+                    # fallback to external (may still work for some hosts)
+                    img_html = f'<img src="{html.escape(src)}" width="{w}">'
+                else:
+                    img_html = "<b>NOT FOUND</b>"
                 link_html = (f'<a href="{html.escape(r["Source URL"])}" target="_blank">open</a>'
                              if r["Source URL"] not in (None, "", "—") else "—")
                 trs.append(
@@ -391,8 +420,9 @@ if lnums:
                     "<thead><tr>"
                     "<th>L-Number</th><th>Thumbnail</th><th>Title</th><th>Source</th>"
                     "</tr></thead><tbody>" + "".join(trs) + "</tbody></table>")
-        st.markdown("### Results (search thumbnails)")
-        st.markdown(table_html(results, img_width), unsafe_allow_html=True)
+
+        st.markdown("### Results (inline thumbnails)")
+        st.markdown(table_html(results, img_width, blobs_map), unsafe_allow_html=True)
 
         hits = sum(1 for r in results if (r["Product Name"] != "NOT FOUND") or (r["Product Image"] != "NOT FOUND"))
         st.success(f"Completed: {hits}/{len(results)} items returned at least a title or an image.")
